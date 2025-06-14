@@ -1,0 +1,1233 @@
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from faas import context as ctx
+from faas.db import models as db
+from faas.db.models import UserExtension
+from faas.log import log as logging
+from faas.common import constants as consts
+from faas.services.api import base
+from faas.services.api import exceptions as ex
+from oslo_utils import timeutils
+import json
+import logging
+
+
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.DEBUG)
+# 可选：配置控制台输出 Handler
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+LOG.addHandler(handler)
+
+# @base.CustomerID
+# def scimclient_get(data):
+#     context = data.pop('context', None) or ctx.get_current()
+#     customer_id = context.customer_id
+#     res = []
+
+
+
+
+@base.CustomerID
+def scimclient_post(data):
+    context = data.pop('context', None) or ctx.get_current()
+    customer_id = context.customer_id
+    name = data.pop('name', None)
+    server_url = data.pop('server_url', None)
+    secret = data.pop('secret', None)
+    realm_id = data.pop('realm_id', None)
+    group_id = data.pop('group_id', None)
+    is_default = data.pop('is_default', False)
+
+    try:
+        scim_server = db.ScimServer.add(context, customer_id=customer_id, server_url=server_url,
+                           name = name, realm_id=realm_id, group_id=group_id, secret = secret,
+                           is_default=is_default)
+
+        if group_id is None:
+            LOG.debug(f"Scim server {server_url} for realm {realm_id} is created successfully")
+        else:
+            LOG.debug(f"Scim server {server_url} for group {group_id} is created successfully")
+
+    except Exception as e:
+        if group_id is None:
+            msg = f"Adding scim server {server_url} for realm {realm_id} failed"
+        else:
+            msg = f"Adding scim server {server_url} for group {group_id} failed"
+
+        LOG.error(e)
+        return ex.internal_error(msg, exc=e)
+
+    else:
+        if not scim_server:
+            if group_id is None:
+                msg = f"Adding scim server {server_url} for realm {realm_id} failed"
+            else:
+                msg = f"Adding scim server {server_url} for group {group_id} failed"
+
+            return ex.bad_request(msg)
+
+        if not scim_server.changed:
+            if group_id is None:
+                msg = f"Scim server {server_url} already exists for realm {realm_id}"
+            else:
+                msg = f"Scim server {server_url} already exists for group {group_id}"
+
+            return ex.conflict(msg)
+
+        if is_default:
+            run_sync(context, scim_server)
+
+        return {'res': scim_server.to_dict()}
+    # context.task_manager.update_status(context.task_id, 3)
+
+
+
+
+    # print("abcd")
+    # scim_id = "b220c003-2335-4576-ba83-e5261875cd1a"
+    # scim_server = db.ScimServer.query_one(context, id=scim_id)
+    #
+    # run_sync(context, scim_server)
+    # return {'res': scim_server.to_dict()}
+
+
+
+def run_sync(context, scim_server):
+    if scim_server.last_synced_at is None:
+        print("enter init")
+        init_sync(context, scim_server)
+    else:
+        print("enter incrm")
+        try:
+            incrm_sync(context, scim_server)
+        except Exception as e:
+            print(e)
+
+def init_sync(context, scim_server):
+    if scim_server.group_id is not None:
+        # All the users within group of id = scim_server.group_id
+        all_users = db.GroupUserMapping.db_query(context, group_id = scim_server.group_id).outerjoin(db.User, db.GroupUserMapping.user_id==db.User.id).with_entities(db.User).all()
+        print(all_users)
+    else:
+        # All the users within realm_id = scim_server.realm_id
+        all_users = db.User.query_all(context, realm_id = scim_server.realm_id)
+
+    init_sync_all_users(context, scim_server, all_users)
+
+    if scim_server.group_id is not None:
+        # The group with id = scim_server.group_id
+        group = db.UserGroup.query_one(context, id=scim_server.group_id)
+        all_groups = [group] if group else []
+    else:
+        # All the groups within realm_id = scim_server.realm_id
+        all_groups = db.UserGroup.query_all(context, realm_id=scim_server.realm_id)
+
+    init_sync_all_groups(context, scim_server, all_groups)
+
+    db.ScimServer.update(context, last_synced_at=timeutils.utcnow(), id=scim_server.id)
+
+def incrm_sync(context, scim_server):
+    # 1. 先同步用户
+    if scim_server.group_id is not None:
+        # 只同步特定group的用户
+        all_users = db.GroupUserMapping.db_query(context, group_id = scim_server.group_id).outerjoin(db.User, db.GroupUserMapping.user_id==db.User.id).with_entities(db.User).all()
+        print(all_users)
+    else:
+        # 同步整个realm的所有用户
+        all_users = db.User.query_all(context, realm_id=scim_server.realm_id)
+
+    incrm_sync_all_users(context, scim_server, all_users)
+
+    all_groups = []
+    if scim_server.group_id is not None:
+        # 只同步这一个特定的group
+        group = db.UserGroup.query_one(context, id=scim_server.group_id)
+        all_groups = [group] if group else []
+    else:
+        # 同步realm下的所有groups
+        all_groups = db.UserGroup.query_all(context, realm_id=scim_server.realm_id)
+    incrm_sync_all_groups(context, scim_server, all_groups)
+    # 更新同步时间
+    db.ScimServer.update(context, last_synced_at=timeutils.utcnow(), id=scim_server.id)
+
+def init_sync_all_users(context, scim_server, all_users):
+    headers = {'Authorization': f"Bearer {scim_server.secret}"}
+    base_url = scim_server.server_url.rstrip('/')
+    # base_url = "https://69.167.109.248:9696/api/v2/scim"
+
+    with SCIMSyncSession() as scim_sessions:
+        processed_success = 0
+        processed_failed = 0
+
+        LOG.info(
+            "Starting initial sync: server_url=%s, to_process=%s",
+            scim_server.server_url,
+            len(all_users)
+        )
+
+        for user in all_users:
+            local_id = user.id
+            user_ext = db.UserExtension.query_one(context, user_id=local_id)
+
+            local_scim = user_to_scim_dict(user, user_ext)
+            match_value = local_scim["userName"]
+            match_attribute = "userName"
+
+            try:
+                get_resp = scim_sessions.get_session.get(
+                    f"{base_url}/Users",
+                    params={'filter': f"{match_attribute} eq \"{match_value}\""},
+                    headers=headers,
+                    timeout=(5, 30)
+                )
+            except Exception as e:
+                LOG.error("GET user exception: local_user_id=%s, server_url=%s, error=%s",
+                          local_id, scim_server.server_url, e)
+                processed_failed += 1
+                continue
+
+            if get_resp.ok:
+                resources = get_resp.json().get('Resources', [])
+                if resources:
+                    # 2. 远端存在，检查是否需要更新
+                    remote = resources[0]
+                    remote_id = remote.get('id')
+                    if users_differ(local_scim, normalize_user_remote_state(remote)):
+                        # 需要更新，使用带重试的PUT
+                        local_scim_with_id = local_scim.copy()
+                        local_scim_with_id['id'] = remote_id
+
+                        try:
+                            put_resp = scim_sessions.put_session.put(
+                                f"{base_url}/Users/{remote_id}",
+                                json=local_scim_with_id,
+                                headers=headers,
+                                timeout=(5, 30)
+                            )
+                        except Exception as e:
+                            LOG.error("PUT user exception: local_user_id=%s, server_url=%s, error=%s",
+                                      local_id, scim_server.server_url, e)
+                            # PUT failed, record GET state
+                            record_user_state(context, scim_server, local_id, remote_id, remote, is_local_data=False)
+                            processed_failed += 1
+                            continue
+                        if put_resp.ok:
+                            # state = put_resp.json()
+                            record_user_state(context, scim_server, local_id, remote_id, local_scim, is_local_data=True)
+                            processed_success += 1
+                            LOG.info("User updated: local_user_id=%s, server_url=%s",
+                                     local_id, scim_server.server_url)
+                        else:
+                            # PUT失败，但记录GET到的状态
+                            # state = remote
+                            record_user_state(context, scim_server, local_id, remote_id, remote, is_local_data=False)
+                            processed_failed += 1
+                            LOG.error("User update failed: local_user_id=%s, server_url=%s, status=%s",
+                                      local_id, scim_server.server_url, put_resp.status_code)
+                    else:
+                        # state = remote
+                        record_user_state(context, scim_server, local_id, remote_id, local_scim, is_local_data=True)
+                        processed_success += 1
+                        LOG.debug("User unchanged: local_user_id=%s, server_url=%s",
+                                  local_id, scim_server.server_url)
+                else:
+                    # 3. 远端不存在，直接创建（不会遇到409）
+                    try:
+                        post_resp = scim_sessions.post_session.post(
+                            f"{base_url}/Users",
+                            json=local_scim,
+                            headers=headers,
+                            timeout=(5, 30)
+                        )
+                    except Exception as e:
+                        LOG.error("POST user exception: local_user_id=%s, server_url=%s, error=%s",
+                                  local_id, scim_server.server_url, e)
+                        processed_failed += 1
+                        continue
+                    if post_resp.ok:
+                        data = post_resp.json()
+                        record_user_state(context, scim_server, local_id, data.get('id'), local_scim,
+                                          is_local_data=True)
+                        processed_success += 1
+                        LOG.info("User created: local_user_id=%s, server_url=%s",
+                                 local_id, scim_server.server_url)
+                    else:
+                        processed_failed += 1
+                        LOG.error("User creation failed: local_user_id=%s, server_url=%s, status=%s",
+                                  local_id, scim_server.server_url, post_resp.status_code)
+            else:
+                # GET失败（已经重试过了）
+                LOG.error("GET user failed: local_user_id=%s, server_url=%s, status=%s",
+                          local_id, scim_server.server_url, get_resp.status_code)
+                processed_failed += 1
+
+    total_processed = processed_success + processed_failed
+    LOG.info(
+        "Initial sync completed: server_url=%s, processed_success=%d, processed_failed=%d, "
+        "total_processed=%d",
+        scim_server.server_url,
+        processed_success,
+        processed_failed,
+        total_processed,
+    )
+
+
+def init_sync_all_groups(context, scim_server, all_groups):
+    """同步所有groups"""
+    headers = {'Authorization': f"Bearer {scim_server.secret}"}
+    base_url = scim_server.server_url.rstrip('/')
+    # base_url = "https://69.167.109.248:9696/api/v2/scim"
+
+    with SCIMSyncSession() as scim_sessions:
+        processed_success = 0
+        processed_failed = 0
+
+        LOG.info(
+            "Starting initial group sync: server_url=%s, to_process=%d",
+            scim_server.server_url,
+            len(all_groups)
+        )
+
+        for group in all_groups:
+            local_id = group.id
+            # 获取group的成员列表
+            group_members = db.GroupUserMapping.db_query(context, group_id = local_id).outerjoin(db.User, db.GroupUserMapping.user_id==db.User.id).with_entities(db.User).all()
+
+            # 传入context和scim_server以便查找远端用户ID
+            local_scim = group_to_scim_dict(context, group, group_members, scim_server)
+            match_value = local_scim["displayName"]
+            match_attribute = "displayName"
+
+            try:
+                get_resp = scim_sessions.get_session.get(
+                    f"{base_url}/Groups",
+                    params={'filter': f'{match_attribute} eq "{match_value}"'},
+                    headers=headers,
+                    timeout=(5, 30)
+                )
+            except Exception as e:
+                LOG.error("GET group exception: local_group_id=%s, server_url=%s, error=%s",
+                          local_id, scim_server.server_url, e)
+                processed_failed += 1
+                continue
+
+            if get_resp.ok:
+                resources = get_resp.json().get('Resources', [])
+                if resources:
+                    # 2. 远端存在，直接PUT更新（不比较差异）
+                    remote = resources[0]
+                    remote_id = remote.get('id')
+                    local_scim_with_id = local_scim.copy()
+                    local_scim_with_id['id'] = remote_id
+
+                    try:
+                        put_resp = scim_sessions.put_session.put(
+                            f"{base_url}/Groups/{remote_id}",
+                            json=local_scim_with_id,
+                            headers=headers,
+                            timeout=(5, 30)
+                        )
+                    except Exception as e:
+                        LOG.error("PUT group exception: local_group_id=%s, server_url=%s, error=%s",
+                                  local_id, scim_server.server_url, e)
+                        record_group_state(context, scim_server, local_id, remote_id, remote, is_local_data=False)
+                        processed_failed += 1
+                        continue
+                    if put_resp.ok:
+                        # state = put_resp.json()
+                        record_group_state(context, scim_server, local_id, remote_id, local_scim, is_local_data=True)
+                        processed_success += 1
+                        LOG.info("Group updated: local_group_id=%s, server_url=%s",
+                                 local_id, scim_server.server_url)
+                    else:
+                        # PUT失败，但记录GET到的状态
+                        # state = remote
+                        record_group_state(context, scim_server, local_id, remote_id, remote, is_local_data=False)
+                        processed_failed += 1
+                        LOG.error("Group update failed: local_group_id=%s, server_url=%s, status=%s",
+                                  local_id, scim_server.server_url, put_resp.status_code)
+                    # 记录状态（无论PUT成功与否）
+                else:
+                    # 3. 远端不存在，直接创建
+                    try:
+                        post_resp = scim_sessions.post_session.post(
+                            f"{base_url}/Groups",
+                            json=local_scim,
+                            headers=headers,
+                            timeout=(5, 30)
+                        )
+                    except Exception as e:
+                        LOG.error("POST group exception: local_group_id=%s, server_url=%s, error=%s",
+                                  local_id, scim_server.server_url, e)
+                        processed_failed += 1
+                        continue
+                    if post_resp.ok:
+                        data = post_resp.json()
+                        record_group_state(context, scim_server, local_id, data.get('id'), local_scim,
+                                           is_local_data=True)
+                        processed_success += 1
+                        LOG.info("Group created: local_group_id=%s, server_url=%s",
+                                 local_id, scim_server.server_url)
+                    else:
+                        processed_failed += 1
+                        LOG.error("Group creation failed: local_group_id=%s, server_url=%s, status=%s",
+                                  local_id, scim_server.server_url, post_resp.status_code)
+            else:
+                LOG.error("GET group failed: local_group_id=%s, server_url=%s, status=%s",
+                          local_id, scim_server.server_url, get_resp.status_code)
+                processed_failed += 1
+
+            # with语句结束，所有session已自动关闭
+        total_processed = processed_success + processed_failed
+        LOG.info(
+            "Initial group sync completed: server_url=%s, processed_success=%d, processed_failed=%d, "
+            "total_processed=%d",
+            scim_server.server_url,
+            processed_success,
+            processed_failed,
+            total_processed,
+        )
+
+
+def incrm_sync_all_users(context, scim_server, all_users):
+    """增量同步所有用户"""
+    headers = {'Authorization': f"Bearer {scim_server.secret}"}
+    base_url = scim_server.server_url.rstrip('/')
+
+    with SCIMSyncSession() as scim_sessions:
+
+        local_map = {u.id: u for u in all_users}
+        remote_states = db.RemoteUserState.query_all(
+            context,
+            server_id=scim_server.id
+        )
+        remote_map = {rs.local_user_id: rs for rs in remote_states}
+
+        to_process = len(local_map)  # All local users
+        to_delete = len([rid for rid in remote_map if rid not in local_map])
+        expected_total = to_process + to_delete
+
+        processed_success = 0
+        processed_failed = 0
+
+        LOG.info(
+            "Starting incremental sync: server_url=%s, to_process=%d, to_delete=%d, expected_total=%d",
+            scim_server.server_url,
+            to_process,
+            to_delete,
+            expected_total
+        )
+
+        # 1. 处理新增和更新
+        for local_id, user in local_map.items():
+            user_ext = db.UserExtension.query_one(context, user_id=user.id)
+            local_scim = user_to_scim_dict(user, user_ext)
+            rs = remote_map.get(local_id)
+
+            if not rs:
+                # 新用户 - 使用409转PUT处理
+                result, state_to_record= handle_user_post_with_409_to_put(
+                    scim_sessions, base_url, local_scim, headers, local_id)
+
+                if result in ['created', 'updated', 'unchanged']:
+                    record_user_state(context, scim_server, local_id,
+                                    state_to_record.get('id'), local_scim, is_local_data=True)
+                    processed_success += 1
+
+                else:
+                    processed_failed += 1
+
+                    if isinstance(state_to_record, dict) and state_to_record.get('id'):
+                        record_user_state(context, scim_server, local_id,
+                                        state_to_record.get('id'), state_to_record, is_local_data=False)
+
+            else:
+                # 现有用户，检查是否需要更新
+                remote_json = rs.remote_state
+                if users_differ(local_scim, remote_json):
+                    # 需要更新 - 使用带重试的PUT
+                    local_scim_with_id = local_scim.copy()
+                    local_scim_with_id['id'] = rs.remote_user_id
+                    try:
+                        put_resp = scim_sessions.put_session.put(
+                            f"{base_url}/Users/{rs.remote_user_id}",
+                            json=local_scim_with_id,
+                            headers=headers,
+                            timeout=(5, 30)
+                        )
+                    except Exception as e:
+                        processed_failed += 1
+                        LOG.error(
+                            "User update exception: local_user_id=%s, server_url=%s, error=%s",
+                            local_id,
+                            scim_server.server_url,
+                            e,
+                        )
+                        continue
+                    if put_resp.ok:
+                        # 更新成功，刷新本地远端状态记录
+                        updated_state = put_resp.json()
+                        # 更新RemoteUserState记录
+
+                        record_user_state(context, scim_server, local_id,
+                                          updated_state.get('id'), local_scim, is_local_data=True)
+
+                        processed_success += 1
+                        LOG.info("User updated: local_user_id=%s, server_url=%s", local_id, scim_server.server_url)
+                    else:
+                        processed_failed += 1
+                        LOG.error(
+                            "User update failed: local_user_id=%s, server_url=%s, status=%s",
+                            local_id,
+                            scim_server.server_url,
+                            put_resp.status_code
+                        )
+
+                else:
+                    # 没有变化
+                    processed_success += 1
+                    LOG.info("User unchanged: local_user_id=%s, server_url=%s", local_id, scim_server.server_url)
+        # 2. 处理删除
+        for local_id, rs in remote_map.items():
+            if local_id not in local_map:
+                # 本地已删除，需要删除远端
+                try:
+                    delete_resp = scim_sessions.delete_session.delete(
+                        f"{base_url}/Users/{rs.remote_user_id}",
+                        headers=headers,
+                        timeout=(5, 30)
+                    )
+                except Exception as e:
+                    processed_failed += 1
+                    LOG.error(
+                        "User deletion exception: local_user_id=%s, server_url=%s, error=%s",
+                        local_id,
+                        scim_server.server_url,
+                        e
+                    )
+                    continue
+                if delete_resp.ok or delete_resp.status_code == 404:
+                    # 删除成功或已经不存在，删除本地记录
+                    db.RemoteUserState.delete(context, id=rs.id)
+                    processed_success += 1
+                    LOG.info("User deleted: local_user_id=%s, server_url=%s", local_id, scim_server.server_url)
+
+                else:
+                        processed_failed += 1
+                        LOG.error(
+                            "User deletion failed: local_user_id=%s, server_url=%s, status=%s",
+                            local_id,
+                            scim_server.server_url,
+                            delete_resp.status_code
+                        )
+
+    total_processed = processed_success + processed_failed
+    LOG.info(
+        "Incremental sync completed: server_url=%s, processed_success=%s, processed_failed=%s, total_processed=%s",
+        scim_server.server_url,
+        processed_success,
+        processed_failed,
+        total_processed,
+    )
+
+def incrm_sync_all_groups(context, scim_server, all_groups):
+    """增量同步所有groups"""
+    headers = {'Authorization': f"Bearer {scim_server.secret}"}
+    base_url = scim_server.server_url.rstrip('/')
+
+    with SCIMSyncSession() as scim_sessions:
+        local_map = {g.id: g for g in all_groups}
+
+        remote_states = db.RemoteGroupState.query_all(
+            context,
+            server_id=scim_server.id
+        )
+
+        remote_map = {rs.local_group_id: rs for rs in remote_states}
+
+        to_process = len(local_map)  # All local groups
+        to_delete = len([rid for rid in remote_map if rid not in local_map])
+        expected_total = to_process + to_delete
+
+        processed_success = 0
+        processed_failed = 0
+
+        LOG.info(
+            "Starting incremental group sync: server_url=%s, to_process=%d, to_delete=%d, expected_total=%d",
+            scim_server.server_url,
+            to_process,
+            to_delete,
+            expected_total
+        )
+
+        for group in all_groups:
+            local_id = group.id
+
+            group_members = db.GroupUserMapping.db_query(
+                context,
+                group_id=local_id
+            ).outerjoin(
+                db.User,
+                db.GroupUserMapping.user_id == db.User.id
+            ).with_entities(db.User).all()
+
+            local_scim = group_to_scim_dict(context, group, group_members, scim_server)
+            rs = remote_map.get(local_id)
+
+            if not rs:
+                result, state_to_record = handle_group_post_with_409_to_put(
+                    scim_sessions, base_url, local_scim, headers, local_id)
+                if result in ['created', 'updated']:
+                    record_group_state(context, scim_server, local_id,
+                                       state_to_record.get('id'), local_scim, is_local_data=True)
+                    processed_success += 1
+                else:
+                    processed_failed += 1
+                    if isinstance(state_to_record, dict) and state_to_record.get('id'):
+                        record_group_state(context, scim_server, local_id,
+                                           state_to_record.get('id'), state_to_record, is_local_data=False)
+
+            else:
+                stored_state = rs.remote_state
+
+                if groups_differ(local_scim, stored_state):
+                    # 需要更新 - 使用带重试的PUT
+                    local_scim_with_id = local_scim.copy()
+                    local_scim_with_id['id'] = rs.remote_group_id
+
+                    try:
+                        put_resp = scim_sessions.put_session.put(
+                            f"{base_url}/Groups/{rs.remote_group_id}",
+                            json=local_scim_with_id,
+                            headers=headers,
+                            timeout=(5, 30)
+                        )
+                    except Exception as e:
+                        processed_failed += 1
+                        LOG.error("Group update exception: local_group_id=%s, server_url=%s, error=%s",
+                                  local_id, scim_server.server_url, e)
+                        continue
+                    if put_resp.ok:
+                        record_group_state(context, scim_server, local_id,
+                                           rs.remote_group_id, local_scim, is_local_data=True)
+                        processed_success += 1
+                        LOG.info("Group updated: local_group_id=%s, server_url=%s",
+                                 local_id, scim_server.server_url)
+                    else:
+                        processed_failed += 1
+                        LOG.error("Group update failed: local_group_id=%s, server_url=%s, status=%s",
+                                  local_id, scim_server.server_url, put_resp.status_code)
+                else:
+                    processed_success += 1
+                    LOG.debug("Group unchanged: local_group_id=%s, server_url=%s",
+                              local_id, scim_server.server_url)
+        # 2. 处理删除
+        for local_id, rs in remote_map.items():
+            if local_id not in local_map:
+                # 本地已删除，需要删除远端
+                try:
+                    delete_resp = scim_sessions.delete_session.delete(
+                        f"{base_url}/Groups/{rs.remote_group_id}",
+                        headers=headers,
+                        timeout=(5, 30)
+                    )
+                except Exception as e:
+                    processed_failed += 1
+                    LOG.error("Group deletion exception: local_group_id=%s, server_url=%s, error=%s",
+                              local_id, scim_server.server_url, e)
+                    continue
+                if delete_resp.ok or delete_resp.status_code == 404:
+                    # 删除成功或已经不存在，删除本地记录
+                    db.RemoteGroupState.delete(context, id=rs.id)
+                    processed_success += 1
+                    LOG.info("Group deleted: local_group_id=%s, server_url=%s",
+                             local_id, scim_server.server_url)
+                else:
+                    processed_failed += 1
+                    LOG.error("Group deletion failed: local_group_id=%s, server_url=%s, status=%s",
+                              local_id, scim_server.server_url, delete_resp.status_code)
+
+
+    total_processed = processed_success + processed_failed
+    LOG.info(
+        "Incremental group sync completed: server_url=%s, processed_success=%d, processed_failed=%d, "
+        "total_processed=%d",
+        scim_server.server_url,
+        processed_success,
+        processed_failed,
+        total_processed,
+    )
+
+def handle_user_post_with_409_to_put(scim_sessions, base_url, user_data, headers, local_id):
+
+    try:
+        post_resp = scim_sessions.post_session.post(
+            f"{base_url}/Users",
+            json=user_data,
+            headers=headers,
+            timeout=(5, 30)
+        )
+
+    except Exception as e:
+        LOG.error("POST user exception: local_user_id=%s, server_url=%s, error=%s",
+                  local_id, base_url, e)
+        return 'failed', f"POST exception: {e}"
+
+    if post_resp.ok:
+        LOG.info("User created: local_user_id=%s, server_url=%s",
+                 local_id, base_url)
+        return 'created', post_resp.json()
+
+    elif post_resp.status_code == 409:
+        LOG.debug("User already exists (409), converting to PUT: local_user_id=%s, server_url=%s",
+                  local_id, base_url)
+        # 2. GET获取现有用户ID
+
+        match_attribute = "userName"  # 当前项目使用userName
+        match_value = user_data.get(match_attribute)
+
+        try:
+            get_resp = scim_sessions.get_session.get(
+                f"{base_url}/Users",
+                params={'filter': f'{match_attribute} eq "{match_value}"'},
+                headers=headers,
+                timeout=(5, 30)
+            )
+        except Exception as e:
+            LOG.error("GET user exception (after 409): local_user_id=%s, server_url=%s, error=%s",
+                      local_id, base_url, e)
+            return 'failed', f"GET异常: {e}"
+
+        if get_resp.ok:
+            resources = get_resp.json().get('Resources', [])
+            if resources:
+                existing_user = resources[0]
+                remote_id = existing_user.get('id')
+                # 标准化远端数据用于比较
+                # normalized_remote = normalize_user_remote_state(existing_user)
+                if not users_differ(user_data, normalize_user_remote_state(existing_user)):
+                    # 数据相同，无需PUT，直接返回现有状态
+                    LOG.debug("User unchanged: local_user_id=%s, server_url=%s",
+                              local_id, base_url)
+                    return 'unchanged', existing_user
+
+                # 3. PUT更新
+                user_data_with_id = user_data.copy()
+                user_data_with_id['id'] = remote_id
+
+                try:
+                    put_resp = scim_sessions.put_session.put(
+                        f"{base_url}/Users/{remote_id}",
+                        json=user_data_with_id,
+                        headers=headers,
+                        timeout=(5, 30)
+                    )
+
+                except Exception as e:
+                    # PUT异常，但GET成功了，返回GET到的状态
+                    LOG.error("PUT user exception (after 409): local_user_id=%s, server_url=%s, error=%s",
+                              local_id, base_url, e)
+                    return 'failed', existing_user
+
+                if put_resp.ok:
+                    # PUT成功，返回更新后的状态
+                    LOG.info("User updated (409): local_user_id=%s, server_url=%s",
+                             local_id, base_url)
+                    return 'updated', put_resp.json()
+                else:
+                    # PUT失败，但GET成功了，返回GET到的状态
+                    LOG.error("PUT user failed (after 409): local_user_id=%s, server_url=%s, status=%s",
+                              local_id, base_url, put_resp.status_code)
+                    return 'failed', existing_user
+            else:
+                LOG.error("GET returned empty results (after 409): local_user_id=%s, server_url=%s",
+                          local_id, base_url)
+                return 'failed', "GET returned empty results"
+        else:
+            LOG.error("GET failed (after 409): local_user_id=%s, server_url=%s, status=%s",
+                      local_id, base_url, get_resp.status_code)
+            return 'failed', f"GET failed: {get_resp.status_code}"
+    else:
+        LOG.error("POST user failed: local_user_id=%s, server_url=%s, status=%s",
+                  local_id, base_url, post_resp.status_code)
+        return 'failed', f"POST failed: {post_resp.status_code}"
+
+
+def handle_group_post_with_409_to_put(scim_sessions, base_url, group_data, headers, local_id):
+    """409转PUT处理 - Group版本（不比较差异，直接更新）"""
+    # 1. 尝试POST
+    try:
+        post_resp = scim_sessions.post_session.post(
+            f"{base_url}/Groups",
+            json=group_data,
+            headers=headers,
+            timeout=(5, 30)
+        )
+
+    except Exception as e:
+        LOG.error("POST group exception: local_group_id=%s, server_url=%s, error=%s",
+                  local_id, base_url, e)
+        return 'failed', f"POST exception: {e}"
+
+    if post_resp.ok:
+        LOG.info("Group created: local_group_id=%s, server_url=%s",
+                 local_id, base_url)
+        return 'created', post_resp.json()
+
+    elif post_resp.status_code == 409:
+        LOG.debug("Group already exists (409), converting to PUT: local_group_id=%s, server_url=%s",
+                  local_id, base_url)
+        # 2. GET获取现有group ID
+        match_attribute = "displayName"  # group使用displayName作为匹配属性
+        match_value = group_data.get(match_attribute)
+
+        try:
+            get_resp = scim_sessions.get_session.get(
+                f"{base_url}/Groups",
+                params={'filter': f'{match_attribute} eq "{match_value}"'},
+                headers=headers,
+                timeout=(5, 30)
+            )
+
+        except Exception as e:
+            LOG.error("GET group exception (after 409): local_group_id=%s, server_url=%s, error=%s",
+                      local_id, base_url, e)
+            return 'failed', f"GET exception: {e}"
+
+        if get_resp.ok:
+            resources = get_resp.json().get('Resources', [])
+            if resources:
+                existing_group = resources[0]
+                remote_id = existing_group.get('id')
+
+                LOG.debug("Executing PUT update: local_group_id=%s, server_url=%s",
+                          local_id, base_url)
+
+                group_data_with_id = group_data.copy()
+                group_data_with_id['id'] = remote_id
+
+                try:
+                    put_resp = scim_sessions.put_session.put(
+                        f"{base_url}/Groups/{remote_id}",
+                        json=group_data_with_id,
+                        headers=headers,
+                        timeout=(5, 30)
+                    )
+
+                except Exception as e:
+                    LOG.error("PUT group exception (after 409): local_group_id=%s, server_url=%s, error=%s",
+                              local_id, base_url, e)
+                    return 'failed', existing_group
+
+                if put_resp.ok:
+                    LOG.info("Group updated (409): local_group_id=%s, server_url=%s",
+                             local_id, base_url)
+                    return 'updated', put_resp.json()
+                else:
+                    LOG.error("PUT group failed (after 409): local_group_id=%s, server_url=%s, status=%s",
+                              local_id, base_url, put_resp.status_code)
+                    return 'failed', existing_group
+            else:
+                LOG.error("GET returned empty results (after 409): local_group_id=%s, server_url=%s",
+                          local_id, base_url)
+                return 'failed', "GET returned empty results"
+        else:
+            LOG.error("GET failed (after 409): local_group_id=%s, server_url=%s, status=%s",
+                      local_id, base_url, get_resp.status_code)
+            return 'failed', f"GET failed: {get_resp.status_code}"
+    else:
+        LOG.error("POST group failed: local_group_id=%s, server_url=%s, status=%s",
+                  local_id, base_url, post_resp.status_code)
+        return 'failed', f"POST failed: {post_resp.status_code}"
+
+def users_differ(local: dict, remote: dict, match_attribute: str = 'userName') -> bool:
+    """
+    添加调试信息的版本，帮助找出具体差异
+    """
+    print("=== 开始比较用户 ===")
+    print("本地数据:", local)
+    print("远端数据:", remote)
+    # 确保匹配属性也被检查
+    if match_attribute not in consts.SCIM_U_SG_DICT:
+        attrs_to_check = consts.SCIM_U_SG_DICT | {match_attribute}
+    else:
+        attrs_to_check = consts.SCIM_U_SG_DICT
+    # 1. 单值属性比较
+    print("检查单值属性:", attrs_to_check)
+    if _compare_single_valued_attributes(local, remote, attrs_to_check):
+        return True
+    # 2. 多值属性比较
+    print("检查多值属性:", consts.SCIM_U_MT_DICT)
+    for attr in consts.SCIM_U_MT_DICT:
+        if _compare_multi_valued_attribute_generic(local, remote, attr):
+            print(f"多值属性 {attr} 不同")
+            print(f"  local: {local.get(attr, [])}")
+            print(f"  remote: {remote.get(attr, [])}")
+            return True
+    # 3. 复合属性比较
+    print("检查复合属性:", consts.SCIM_U_CX_DICT.keys())
+    for attr, fields in consts.SCIM_U_CX_DICT.items():
+        if _compare_complex_valued_attributes(local.get(attr, {}), remote.get(attr, {}), fields):
+            print(f"复合属性 {attr} 不同")
+            print(f"  local: {local.get(attr, {})}")
+            print(f"  remote: {remote.get(attr, {})}")
+            return True
+    print("=== 比较结果：无差异 ===")
+    return False
+
+def _compare_single_valued_attributes(local: dict, remote: dict, attributes: set) -> bool:
+    """比较单值属性"""
+    for attr in attributes:
+        local_value = _normalize_value(local.get(attr))
+        remote_value = _normalize_value(remote.get(attr))
+
+        if local_value != remote_value:
+            print(f"单值属性 {attr} 不同: local={local_value}, remote={remote_value}")
+            return True
+    return False
+
+def _compare_multi_valued_attribute_generic(local: dict, remote: dict, attr_name: str) -> bool:
+    """通用的多值属性比较函数，使用JSON规范化"""
+    local_list = local.get(attr_name, [])
+    remote_list = remote.get(attr_name, [])
+    return _compare_multi_valued_canonical(local_list, remote_list)
+
+def _compare_multi_valued_canonical(local_list: list, remote_list: list) -> bool:
+    """使用规范化JSON序列化和排序比较多值属性"""
+    # 空列表且都空：无差异
+    if not local_list and not remote_list:
+        return False
+    # 数量不同：必然有差异
+    if len(local_list) != len(remote_list):
+        print(f"  元素数量不同: local={len(local_list)}, remote={len(remote_list)}")
+        return True
+
+    # 为每个元素创建规范化JSON，再排序比较
+    def canonical(item):
+        return json.dumps(
+            item,
+            sort_keys=True,  # 对dict键递归排序
+            separators=(',', ':'),  # 紧凑格式，去掉多余空白
+            ensure_ascii=False  # 允许非ASCII字符
+        )
+
+    local_strs = sorted(canonical(item) for item in local_list)
+    remote_strs = sorted(canonical(item) for item in remote_list)
+    # 如果发现差异，打印详细信息
+    if local_strs != remote_strs:
+        # 找出不同的元素
+        diff_local = [l for l in local_strs if l not in remote_strs]
+        diff_remote = [r for r in remote_strs if r not in local_strs]
+        if diff_local:
+            print(f"  本地不匹配元素: {diff_local}")
+        if diff_remote:
+            print(f"  远端不匹配元素: {diff_remote}")
+        return True
+    return False
+
+def _compare_complex_valued_attributes(local: dict, remote: dict, fields: set) -> bool:
+    if local == {} and remote == {}:
+        return False
+
+    if local == {} or remote == {}:
+        return True
+
+    """通用复合属性比较函数并记录日志"""
+    for f in fields:
+        # 特殊处理manager嵌套对象
+        if f == 'manager':
+            local_manager = local.get(f) or {}
+            remote_manager = remote.get(f) or {}
+
+            if local_manager == {} and remote_manager == {}:
+                continue
+            # 如果一个有manager，而另一个没有
+            if local_manager != remote_manager:
+                print(
+                    f"  manager存在性不同: local={'有' if local_manager else '无'}, remote={'有' if remote_manager else '无'}")
+                return True
+
+            # 如果两边都有manager，比较其内部字段
+            if local_manager and remote_manager:
+                manager_fields = {'value'}  # manager对象的字段
+                for mf in manager_fields:
+                    local_value = _normalize_value(local_manager.get(mf))
+                    remote_value = _normalize_value(remote_manager.get(mf))
+                    if local_value != remote_value:
+                        print(f"  manager.{mf}不同: local={local_value}, remote={remote_value}")
+                        return True
+        else:
+            # 常规字段的比较
+            local_value = _normalize_value(local.get(f))
+            remote_value = _normalize_value(remote.get(f))
+            if local_value != remote_value:
+                print(f"  字段{f}不同: local={local_value}, remote={remote_value}")
+
+                return True
+
+    return False
+
+def groups_differ(local: dict, stored: dict) -> bool:
+    """
+    比较本地当前状态与上次存储的状态
+    """
+    # 比较基本属性
+    for attr in ['displayName', 'externalId']:
+        if _normalize_value(local.get(attr)) != _normalize_value(stored.get(attr)):
+            print(f"属性 {attr} 不同")
+            return True
+    # 比较members（都是本地构建的，可以直接比较）
+    local_members = local.get('members', [])
+    stored_members = stored.get('members', [])
+    # 提取member的value（远端ID）进行比较
+    local_member_ids = {m.get('value') for m in local_members}
+    stored_member_ids = {m.get('value') for m in stored_members}
+
+    if local_member_ids != stored_member_ids:
+        print(f"成员不同: 本地={local_member_ids}, 存储={stored_member_ids}")
+        return True
+    return False
+
+
+def normalize_user_remote_state(remote_scim):
+    normalized = {}
+    print("remote scim user--------------")
+    print(remote_scim)
+
+    for field in consts.SCIM_U_FIELDS:
+        if field == 'active':
+            if field in remote_scim:
+                normalized[field] = remote_scim[field]
+        else:
+            if field in remote_scim and remote_scim[field]:
+                normalized[field] = remote_scim[field]
+
+    print(normalized)
+    return normalized
+
+def normalize_group_remote_state(remote_scim):
+    """标准化远端group数据用于存储"""
+    # 只保留业务相关的字段
+    normalized = {}
+
+    for field in consts.SCIM_G_FIELDS:
+        if field == 'members':
+            remote_members = remote_scim.get('members') or []
+            normalized['members'] = [
+                {'value': member.get('value')}
+                for member in remote_members
+                if member.get('value')
+            ]
+        else:
+            if field in remote_scim and remote_scim[field]:
+                normalized[field] = remote_scim[field]
+
+    print("标准化后的group数据:", normalized)
+    return normalized
+
+def _normalize_value(value):
+    if isinstance(value, str):
+        value = value.strip()
+        return None if value == '' else value
+    return value
+
+def record_user_state(context, server, local_id, remote_id, state_data, is_local_data=True):
+    """
+    记录远端用户状态，存储标准化后的数据
+    这个函数确保存储的数据格式与to_scim_dict()一致，
+    这样incremental_sync就可以直接使用users_differ()进行比较
+    """
+    # 关键步骤：标准化远端数据
+    # 这一步将"精装版"转换为"简装版"
+    if is_local_data:
+        state_to_store = state_data
+    else:
+        state_to_store = normalize_user_remote_state(state_data)
+
+    existing = db.RemoteUserState.query_one(context, server_id = server.id, local_user_id=local_id)
+
+    if existing:
+        # 更新现有记录
+        db.RemoteUserState.update(context, id=existing.id, remote_user_id=remote_id, remote_state=state_to_store, last_synced_at=timeutils.utcnow())
+    else:
+        db.RemoteUserState.add(context, server_id = server.id, local_user_id=local_id, remote_user_id=remote_id, remote_state=state_to_store, last_synced_at=timeutils.utcnow())
+
+def record_group_state(context, server, local_id, remote_id, state_data, is_local_data=True):
+    if is_local_data:
+        state_to_store = state_data
+    else:
+        state_to_store = normalize_group_remote_state(state_data)
+
+    # 查找是否已存在记录
+    existing = db.RemoteGroupState.query_one(
+        context,
+        server_id=server.id,
+        local_group_id=local_id
+    )
+
+    if existing:
+        db.RemoteGroupState.update(context, id=existing.id, remote_group_id=remote_id, remote_state=state_to_store, last_synced_at=timeutils.utcnow())
+    else:
+        db.RemoteGroupState.add(context, server_id = server.id, local_group_id=local_id, remote_group_id=remote_id, remote_state=state_to_store, last_synced_at=timeutils.utcnow())
+
+def user_to_scim_dict(user, user_extension):
+    scim_user = {"schemas": [consts.SCH_SCIM_CORE_USER], "userName": user.username,
+                 "active": user.active}
+
+    if not user_extension:
+        print(user.username)
+        # 本地用户可能需要从 user.email 和 user.mobile_number 构建基本的 emails/phoneNumbers
+
+        scim_user["externalId"] = user.id
+        scim_user["emails"] = [{"value": user.email, "type": "work", "primary": True}]
+        # scim_user["displayName"] = user.username
+        # scim_user["name"] = {"familyName": user.username, "givenName": user.username}
+        if user.mobile_number:
+            scim_user["phoneNumbers"] = [{"value": user.mobile_number, "type": "work", "primary": True}]
+    else:
+        ext_data = {consts.USER_EXT_TO_SCIM_ATTRS[k]: getattr(user_extension, k, None)
+                    for k in consts.USER_EXT_TO_SCIM_ATTRS.keys()
+                    if getattr(user_extension, k, None)}
+
+
+        for key, value in list(ext_data.items()):
+            if key in consts.USER_EXT_CX_ATTRS:
+                try:
+                    val = json.loads(value)
+                except (ValueError, TypeError) as e:
+                    del ext_data[key]
+                else:
+                    if isinstance(val, (list, dict)):
+                       if val:
+                            ext_data[key] = val
+                       else:
+                            del ext_data[key]
+                    else:
+                        del ext_data[key]
+
+        scim_user.update(ext_data)
+
+        # 处理企业扩展schema
+        enterprise_schema = consts.SCH_SCIM_EXT_USER
+        if enterprise_schema in scim_user:
+            if enterprise_schema not in scim_user["schemas"]:
+                scim_user["schemas"].append(enterprise_schema)
+    print("local scim user -------------------------")
+    print(scim_user)
+    return scim_user
+
+def group_to_scim_dict(context, group, members, scim_server):
+    """将本地group转换为SCIM格式，使用远端用户ID"""
+    # 构建成员列表 - 需要查找每个用户的远端ID
+    # base_url = scim_server.server_url.rstrip('/')
+    # base_url = "https://69.167.109.248:9696/api/v2/scim"
+    member_list = []
+
+    for user in members:
+        # 查找该用户的远端ID
+        remote_user_state = db.RemoteUserState.query_one(
+            context,
+            server_id=scim_server.id,
+            local_user_id=user.id
+        )
+        if remote_user_state and remote_user_state.remote_user_id:
+            # 使用远端用户ID
+            member_list.append({
+                "value": remote_user_state.remote_user_id,  # 远端用户ID
+                # "$ref": f"{base_url}/Users/{remote_user_state.remote_user_id}",  # 使用远端ID
+                # "type": "User"
+            })
+        else:
+            # 如果用户还没有同步，记录警告
+            print(f"警告：用户 {user.username} (ID: {user.id}) 还没有远端ID，跳过添加到group")
+
+    externalId = group.external_id if group.external_id else group.id
+
+    scim_group = {
+        "schemas": [consts.SCH_SCIM_CORE_GROUP],
+        "displayName": group.name,
+        "externalId": externalId,
+        "members": member_list
+    }
+
+    print(scim_group)
+    return scim_group
+
+
+
+class SCIMSyncSession:
+    def __init__(self):
+        TEMPORARY_ERROR_CODES = (429, 500, 502, 503, 504)
+        # GET session
+        self.get_session = self._create_session(
+            retries=5,
+            backoff_factor=1,
+            status_forcelist=TEMPORARY_ERROR_CODES,
+            allowed_methods=["GET"]
+        )
+        self.get_session.verify = False
+        # PUT session
+        self.put_session = self._create_session(
+            retries=3,
+            backoff_factor=1,
+            status_forcelist=TEMPORARY_ERROR_CODES,
+            allowed_methods=["PUT"]
+        )
+        self.put_session.verify = False
+        # DELETE session
+        self.delete_session = self._create_session(
+            retries=3,
+            backoff_factor=1,
+            status_forcelist=TEMPORARY_ERROR_CODES,
+            allowed_methods=["DELETE"]
+        )
+        self.delete_session.verify = False
+        # POST session
+        self.post_session = self._create_session(
+            retries=2,
+            backoff_factor=1,
+            status_forcelist=TEMPORARY_ERROR_CODES,  # 与其他方法一致
+            allowed_methods=["POST"],
+        )
+        self.post_session.verify = False
+
+    def _create_session(self, retries, backoff_factor, status_forcelist, allowed_methods):
+        """创建带重试策略的session"""
+        retry_strategy = Retry(
+            total=retries,
+            backoff_factor=backoff_factor,
+            status_forcelist=status_forcelist,
+            allowed_methods=allowed_methods,
+            respect_retry_after_header=True,
+            raise_on_status=False
+        )
+        session = requests.Session()
+        session.verify = False
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
+
+    def close_all(self):
+        """关闭所有session，释放连接池资源"""
+        self.get_session.close()
+        self.put_session.close()
+        self.delete_session.close()
+        self.post_session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close_all()
+
+
+
+
+
+
+
